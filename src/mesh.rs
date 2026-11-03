@@ -8,14 +8,30 @@ use tokio::sync::RwLock;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-/// Default mesh nodes. Override via MESHD_NODES env var (comma-separated "name=ip" pairs)
-/// or via [machine.peers] in meshd.toml.
-pub fn mesh_nodes() -> Vec<(&'static str, &'static str)> {
-    // In production, read from config. These are examples.
+/// Mesh nodes as `(name, ip)` pairs, read from `MESHD_NODES`
+/// (comma-separated `name=ip`, e.g. `studio=100.64.0.1,render=100.64.0.2`).
+/// Falls back to two example nodes when the variable is unset or empty.
+pub fn mesh_nodes() -> Vec<(String, String)> {
+    let parsed = std::env::var("MESHD_NODES")
+        .map(|raw| parse_mesh_nodes(&raw))
+        .unwrap_or_default();
+    if !parsed.is_empty() {
+        return parsed;
+    }
     vec![
-        ("node1", "100.64.0.1"),
-        ("node2", "100.64.0.2"),
+        ("node1".to_string(), "100.64.0.1".to_string()),
+        ("node2".to_string(), "100.64.0.2".to_string()),
     ]
+}
+
+fn parse_mesh_nodes(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (name, ip) = pair.split_once('=')?;
+            let (name, ip) = (name.trim(), ip.trim());
+            (!name.is_empty() && !ip.is_empty()).then(|| (name.to_string(), ip.to_string()))
+        })
+        .collect()
 }
 
 pub const RATE_LIMIT_SECONDS: u64 = 10;
@@ -476,7 +492,7 @@ pub async fn claim_task(claimer: &str) -> Result<Option<MeshTask>> {
 fn resolve_machine_ip(machine: &str) -> Result<String> {
     for (name, ip) in mesh_nodes() {
         if name == machine {
-            return Ok(ip.to_string());
+            return Ok(ip);
         }
     }
     Err(anyhow!("unknown machine: {}", machine))
@@ -531,4 +547,21 @@ pub fn is_ip_allowed(ip: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_nodes_parse_name_ip_pairs_and_skip_malformed_entries() {
+        assert_eq!(
+            parse_mesh_nodes(" studio=100.64.0.1, render = 100.64.0.2 ,broken,=1.2.3.4,x="),
+            vec![
+                ("studio".to_string(), "100.64.0.1".to_string()),
+                ("render".to_string(), "100.64.0.2".to_string()),
+            ]
+        );
+        assert!(parse_mesh_nodes("").is_empty());
+    }
 }

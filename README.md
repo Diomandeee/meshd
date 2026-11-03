@@ -1,39 +1,38 @@
 # meshd
 
-A Rust daemon that manages AI agent terminals (PTYs) across a fleet of machines. Each agent runs in a named slot — a long-lived PTY process with an HTTP interface for injection, streaming output, and status monitoring.
+A Rust daemon that runs AI coding agents in named terminal slots and puts an HTTP API in front of them. Each slot is a long-lived PTY process. You can send it a prompt, read its recent output, stream it live and check its state. Several machines can run meshd and relay to each other.
 
-Runs on all 5 machines in a Tailscale mesh. Coordinates 61 agents across 4 AI providers (Claude, OpenCode, Gemini, Codex).
+I built it to run coding agents (Claude Code, Codex, Gemini, OpenCode) on a few Macs over Tailscale and coordinate them from one place.
 
 ---
 
 ## Why not just tmux?
 
-tmux send-keys works fine for a single machine. It breaks down as soon as you want more:
+`tmux send-keys` works on one machine. It gets hard to trust beyond that:
 
-- **Static registry vs dynamic discovery.** With tmux, you grep for PIDs and hope they match. meshd has a named slot registry with defined states (`Unborn`, `Spawning`, `Ready`, `Busy`). You always know whether a slot exists.
-- **HTTP API vs send-keys.** `tmux send-keys` is fragile with special characters, multi-line prompts, and concurrent access. A POST to `/inject/{slot}` is atomic, authenticated, and returns a generation counter.
-- **Ring buffers for output capture.** tmux capture-pane gives you screen content — static, truncated, and lossy. meshd maintains a 500-line ring buffer per slot, drained over SSE. You can read the last N lines or subscribe to the live stream.
-- **Supabase heartbeat for fleet visibility.** Each machine pushes slot state to a central `agent_slots` table every 60 seconds. You get a live view of all 61 agents across 5 machines in a single query.
-- **Rate limiting and auth.** Bearer token on every write endpoint. IP allowlisting for mesh endpoints (Tailscale range + localhost only). 10-second rate limit per endpoint key.
+- **Known state instead of PID guessing.** Each slot has a defined state: `Unborn`, `Spawning`, `Ready` or `Busy`. You always know whether a slot exists and what it's doing.
+- **HTTP instead of send-keys.** send-keys is fragile with special characters, multi-line prompts and concurrent writers. A POST to `/inject/{slot}` is one authenticated write and returns a generation counter.
+- **Ring buffers for output.** `capture-pane` returns screen content, truncated and lossy. meshd keeps a 500-line ring buffer per slot and streams it over SSE.
+- **Optional heartbeat.** Each machine can push its slot states to a Supabase `agent_slots` table every 60 seconds, so one query shows every agent on every machine.
+- **Auth and rate limits.** Bearer token on every write endpoint, an IP allowlist (Tailscale range and localhost) on mesh endpoints, and a 10-second rate limit per endpoint key.
 
-meshd also absorbs the old Python mesh-api — `/relay`, `/broadcast`, `/inject-tmux`, `/task`, `/panes` are all first-class endpoints on the same binary.
+It also replaces an older Python mesh API: `/relay`, `/broadcast`, `/inject-tmux`, `/task` and `/panes` are endpoints on the same binary.
 
 ---
 
-## Quick Start
+## Quick start
 
 **Build:**
 ```bash
 cargo build --release
-# binary: target/release/meshd (4MB, stripped)
-# compile time: ~30s on M-series
+# binary: target/release/meshd
 ```
 
 **Config** (`~/.meshd/meshd.toml`):
 ```toml
 [machine]
-id = "mac1"
-tailscale_ip = "100.84.118.106"
+id = "studio"
+tailscale_ip = "100.64.0.1"
 api_port = 9451
 supabase_url = "https://your-project.supabase.co"
 
@@ -54,30 +53,24 @@ lazy = false   # eager: boots at startup
 
 **Run:**
 ```bash
-SUPABASE_ANON_KEY=your_key MESHD_TOKEN=your_token ./meshd ~/.meshd/meshd.toml
-```
-
-**Install as a LaunchAgent (macOS):**
-```bash
-cp launchagent/com.mesh.meshd.plist ~/Library/LaunchAgents/
-# Edit the plist to set SUPABASE_ANON_KEY and MESHD_TOKEN
-launchctl load ~/Library/LaunchAgents/com.mesh.meshd.plist
+MESHD_TOKEN=your_token MESHD_NODES=studio=100.64.0.1,render=100.64.0.2 \
+  ./target/release/meshd ~/.meshd/meshd.toml
 ```
 
 ---
 
-## API Reference
+## API
 
-All endpoints on `:9451`. Write endpoints require `Authorization: Bearer <token>`. `/health` has no auth.
+All endpoints are on `:9451`. Write endpoints need `Authorization: Bearer <token>`. `/health` has no auth.
 
-### Slot endpoints
+### Slots
 
-**Inject a prompt into a slot:**
+**Send a prompt to a slot:**
 ```bash
 curl -X POST http://localhost:9451/inject/claude-max \
   -H "Authorization: Bearer your_token" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "summarize the last 3 commits in ~/Desktop/myproject"}'
+  -d '{"prompt": "summarize the last 3 commits in ~/src/myproject"}'
 # {"ok":true,"gen":4,"slot":"claude-max"}
 ```
 
@@ -85,12 +78,12 @@ curl -X POST http://localhost:9451/inject/claude-max \
 ```bash
 curl -N http://localhost:9451/stream/claude-max \
   -H "Authorization: Bearer your_token"
-# Replays last 50 lines from ring buffer, then streams live output
+# Replays the last 50 lines from the ring buffer, then streams live output
 # event: line
 # data: > Running task...
 ```
 
-**Read ring buffer snapshot:**
+**Read the ring buffer:**
 ```bash
 curl "http://localhost:9451/read/claude-max?n=20" \
   -H "Authorization: Bearer your_token"
@@ -101,37 +94,35 @@ curl "http://localhost:9451/read/claude-max?n=20" \
 ```bash
 curl http://localhost:9451/status \
   -H "Authorization: Bearer your_token"
-# {"machine":"mac1","slots":[{"name":"claude-max","state":"ready","gen":4,"pid":12345},...]}
+# {"machine":"studio","slots":[{"name":"claude-max","state":"ready","gen":4,"pid":12345},...]}
 ```
 
-**Health check (no auth):**
+**Health (no auth):**
 ```bash
 curl http://localhost:9451/health
-# {"machine":"mac1","uptime_secs":3821,"slots":5}
+# {"machine":"studio","uptime_secs":3821,"slots":5}
 ```
 
----
+### Mesh
 
-### Mesh endpoints
-
-These require auth + Tailscale/localhost IP. The 10-second rate limit applies per endpoint key.
+These need auth and a Tailscale or localhost client IP. The 10-second rate limit applies per endpoint key.
 
 **Relay a request to another machine:**
 ```bash
 curl -X POST http://localhost:9451/relay \
   -H "Authorization: Bearer your_token" \
-  -d '{"machine":"mac4","path":"/inject/codex","body":{"prompt":"run tests"}}'
+  -d '{"machine":"render","path":"/inject/codex","body":{"prompt":"run tests"}}'
 ```
 
-**Broadcast to all nodes (except self):**
+**Broadcast to every other node:**
 ```bash
 curl -X POST http://localhost:9451/broadcast \
   -H "Authorization: Bearer your_token" \
   -d '{"prompt":"checkpoint your current work"}'
-# Fan-out to mac2-mac5 in parallel. Returns per-machine results.
+# Fans out to every node in MESHD_NODES except this one. Returns per-node results.
 ```
 
-**Inject into a tmux session:**
+**Send text to a tmux session:**
 ```bash
 # Local
 curl -X POST http://localhost:9451/inject-tmux \
@@ -141,7 +132,7 @@ curl -X POST http://localhost:9451/inject-tmux \
 # Remote (SCP + SSH)
 curl -X POST http://localhost:9451/inject-tmux \
   -H "Authorization: Bearer your_token" \
-  -d '{"machine":"mac3","prompt":"git status","session":"main"}'
+  -d '{"machine":"render","prompt":"git status","session":"main"}'
 ```
 
 **Queue and claim tasks:**
@@ -149,26 +140,26 @@ curl -X POST http://localhost:9451/inject-tmux \
 # Queue
 curl -X POST http://localhost:9451/task \
   -H "Authorization: Bearer your_token" \
-  -d '{"prompt":"run the nightly sync","from":"mac1"}'
+  -d '{"prompt":"run the nightly sync","from":"studio"}'
 
 # List pending
 curl http://localhost:9451/tasks -H "Authorization: Bearer your_token"
 
-# Claim oldest unclaimed task (atomic, uses lock files to prevent double-claim)
-curl "http://localhost:9451/tasks/claim?claimer=mac4" \
+# Claim the oldest unclaimed task (lock files prevent a double claim)
+curl "http://localhost:9451/tasks/claim?claimer=render" \
   -H "Authorization: Bearer your_token"
 ```
 
-**Discover mesh health:**
+**Mesh health:**
 ```bash
 curl http://localhost:9451/mesh -H "Authorization: Bearer your_token"
-# Pings /health on all 5 nodes in parallel (3s timeout each)
+# Pings /health on every node in parallel, 3 s timeout each
 ```
 
-**List local agent panes:**
+**Local agent panes:**
 ```bash
 curl http://localhost:9451/panes -H "Authorization: Bearer your_token"
-# Lists Claude processes with their TTYs and PIDs
+# Lists agent processes with their TTYs and PIDs
 ```
 
 **Read a tmux pane:**
@@ -179,94 +170,79 @@ curl "http://localhost:9451/read-pane/ttys003?lines=30" \
 
 ---
 
-## Configuration Reference
+## Configuration
 
 ```toml
 [machine]
-id = "mac1"                          # Unique node identifier
-tailscale_ip = "100.84.118.106"      # Used for inter-node identification
-api_port = 9451                      # Primary HTTP port
-mesh_port = 9450                     # Optional: compatibility port (binds a second listener)
-supabase_url = "https://..."         # Project URL for registry
-mesh_auth_token = "override-token"   # Optional: overrides MESHD_TOKEN env var
+id = "studio"                        # This node's name, as used in MESHD_NODES
+tailscale_ip = "100.64.0.1"
+api_port = 9451                      # Main HTTP port
+mesh_port = 9450                     # Optional second listener for older clients
+supabase_url = "https://..."         # Heartbeat registry
+mesh_auth_token = "override-token"   # Optional, overrides MESHD_TOKEN
 
 [[slots]]
-name = "my-agent"       # URL-safe identifier, used in /inject/{name}
+name = "my-agent"         # URL-safe, used in /inject/{name}
 agent = "/usr/bin/myagent"
 args = ["--flag"]
 env = { MY_KEY = "value" }
-lazy = true             # false = boot at startup; true = boot on first inject
-idle_timeout_secs = 1800  # Lazy slots only: kill after this many idle seconds (default 1800)
-rows = 50               # PTY terminal height (default 50)
-cols = 220              # PTY terminal width (default 220)
+lazy = true               # false = boot at startup, true = boot on first inject
+idle_timeout_secs = 1800  # Lazy slots only: stop after this many idle seconds (default 1800)
+rows = 50                 # PTY height (default 50)
+cols = 220                # PTY width (default 220)
 ```
 
-**Environment variables:**
-- `SUPABASE_ANON_KEY` — required for Supabase registration and heartbeat
-- `MESHD_TOKEN` — Bearer token for all authenticated endpoints
-- `RUST_LOG` — log level, e.g. `meshd=debug`
+**Environment:**
+- `MESHD_TOKEN`: bearer token for authenticated endpoints
+- `MESHD_NODES`: the mesh, as comma-separated `name=ip` pairs. Relay, broadcast and `/mesh` use it. Without it meshd uses two example nodes.
+- `SUPABASE_ANON_KEY`: turns on registration and the heartbeat. meshd starts without it and logs a warning.
+- `RUST_LOG`: log level, e.g. `meshd=debug`
 
 ---
 
 ## Architecture
 
 ```
-meshd
-├── main.rs       — startup, config load, eager slot boot, Supabase registration
-├── config.rs     — TOML deserialization (MachineConfig, SlotConfig)
-├── http.rs       — axum router, all HTTP handlers
-├── slot.rs       — Slot struct, state machine, inject/read/subscribe
-├── pty.rs        — fork + execve, PTY setup, ring buffer + broadcast channel
-├── watchdog.rs   — 10s poll: restart dead slots, kill idle lazy slots, warn stuck Busy
-├── registry.rs   — Supabase upsert on boot, PATCH heartbeat every 60s
-└── mesh.rs       — relay, broadcast, tmux injection, task queue, IP allowlist
+src/
+  main.rs       startup, config load, eager slot boot, registration
+  config.rs     TOML config (MachineConfig, SlotConfig)
+  http.rs       axum router and handlers
+  slot.rs       slot state machine, inject / read / subscribe
+  pty.rs        fork + execve, PTY setup, ring buffer and broadcast channel
+  watchdog.rs   10 s poll: restart dead slots, stop idle lazy slots, warn on stuck Busy
+  registry.rs   Supabase upsert on boot, heartbeat every 60 s
+  mesh.rs       nodes, relay, broadcast, tmux injection, task queue, IP allowlist
 ```
 
 ### Slot lifecycle
 
 ```
-Unborn → Spawning → Ready → Busy
-                     ^        |
-                     |        v
-                     +------ (watchdog restarts dead processes)
+Unborn -> Spawning -> Ready -> Busy
+                       ^        |
+                       |        v
+                       +------ (watchdog restarts dead processes)
 ```
 
 - Eager slots (`lazy = false`) boot when meshd starts.
-- Lazy slots boot on the first `/inject` or `/stream` call.
-- The watchdog runs every 10 seconds. It restarts any slot whose child process has exited. It kills lazy slots that have been idle longer than `idle_timeout_secs`.
-- A slot stuck in `Busy` with no output for 10 minutes gets a watchdog warning (logged, not killed).
+- Lazy slots boot on the first `/inject` or `/stream`.
+- The watchdog runs every 10 seconds. It restarts a slot whose process exited and stops lazy slots idle longer than `idle_timeout_secs`.
+- A slot stuck in `Busy` with no output for 10 minutes gets a logged warning, not a kill.
 
-### Output pipeline
+### Output
 
-Each slot has a background tokio task reading from the PTY master fd. It strips ANSI escape sequences, splits on newlines, and writes each line to:
-1. A 500-line ring buffer (VecDeque, mutex-protected)
-2. A broadcast channel (256 slots, for SSE subscribers)
+A tokio task per slot reads the PTY, strips ANSI escapes, splits lines and writes each line to:
+1. a 500-line ring buffer
+2. a broadcast channel (256 deep) for SSE subscribers
 
-`/stream` replays the last 50 lines from the ring, then attaches to the live broadcast channel.
+`/stream` replays the last 50 lines from the ring, then follows the live channel.
 
 ### Task queue
 
-Tasks are JSON files in `~/.claude/state/mesh-inbox/`. Claims use a `.lock` file created with `O_CREAT | O_EXCL` (atomic on POSIX) to prevent two machines from claiming the same task.
+Tasks are JSON files in `~/.claude/state/mesh-inbox/`. A claim creates a `.lock` file with `O_CREAT | O_EXCL`, which is atomic on POSIX, so two machines can't claim the same task.
 
 ### IP allowlist
 
-Mesh endpoints (`/relay`, `/broadcast`, `/inject-tmux`, `/message`, `/task`, `/mesh`) check the client IP. Allowed ranges: `127.0.0.1`, `::1`, Tailscale CGNAT (`100.64.0.0/10`). Requests from outside this range get a 403.
-
----
-
-## Mesh Topology
-
-Five machines connected over Tailscale:
-
-| Node | IP | Role |
-|------|----|------|
-| mac1 | 100.84.118.106 | Orchestrator, build host |
-| mac2 | 100.119.214.88 | iOS / motion domain |
-| mac3 | 100.122.68.52 | Storage / creative domain |
-| mac4 | 100.91.231.93 | Compute, Adobe pipeline |
-| mac5 | 100.109.94.124 | Compute, MLX inference |
-
-All five run the same meshd binary with machine-specific `meshd.toml`. Any node can relay to any other, or broadcast to all remaining nodes in parallel.
+Mesh endpoints (`/relay`, `/broadcast`, `/inject-tmux`, `/message`, `/task`, `/mesh`) check the client IP. Allowed: `127.0.0.1`, `::1` and the Tailscale range `100.64.0.0/10`. Anything else gets a 403.
 
 ---
 
@@ -274,22 +250,19 @@ All five run the same meshd binary with machine-specific `meshd.toml`. Any node 
 
 | Crate | Purpose |
 |-------|---------|
-| tokio 1 (full) | Async runtime |
+| tokio | async runtime |
 | axum 0.7 | HTTP server |
 | nix 0.29 | PTY (openpty, fork, execve) |
-| vt100 0.15 | Terminal emulation (imported; ANSI stripping is inline) |
-| reqwest 0.12 | Outbound HTTP for relay/heartbeat |
-| tokio-stream 0.1 | SSE stream from broadcast channel |
-| serde + toml | Config and JSON |
-| tracing | Structured logging |
-| chrono | Timestamps for task queue and heartbeat |
+| reqwest 0.12 | relay and heartbeat |
+| tokio-stream | SSE from the broadcast channel |
+| serde, toml | config and JSON |
+| tracing | logging |
+| chrono | timestamps |
 
 ---
 
 ## Notes
 
-- The binary strips `CLAUDECODE` from child environments so agents don't think they're running inside Claude Code.
-- PTY dimensions default to 50 rows x 220 cols. Wider columns reduce line-wrapping noise in the ring buffer.
-- Supabase registration is optional. If `SUPABASE_ANON_KEY` is not set, meshd starts normally and logs a warning.
-- The `mesh_port` field lets meshd bind a second listener for backward compatibility with clients still pointing at the old Python mesh-api port (9450).
-- Max prompt size for tmux injection is 10KB.
+- Child processes don't inherit `CLAUDECODE`, so agents don't think they're running inside Claude Code.
+- PTYs default to 50 × 220. Wide columns mean less line wrapping in the ring buffer.
+- Max prompt size for tmux injection is 10 KB.
